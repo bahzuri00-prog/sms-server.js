@@ -1,1 +1,239 @@
-<html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/></head><body>const express = require('express');<br>const cors = require('cors');<br>const path = require('path');<br>const { MongoClient } = require('mongodb');<br>const cron = require('node-cron');<br>require('dotenv').config();<br><br>// ✅ IMPORT THE FREE NUMBER CHECKER<br>const { isValidKePhone } = require('kenya-utils');<br><br>const app = express();<br><a href="http://app.use">app.use</a>(cors());<br><a href="http://app.use">app.use</a>(<a href="http://express.json">express.json</a>({ limit: '10mb' }));<br><br>// --- CONFIGURATION ---<br>const SMSGATE_USER = <a href="http://process.env">process.env</a>.SMSGATE_USER;<br>const SMSGATE_PASS = <a href="http://process.env">process.env</a>.SMSGATE_PASS;<br>const SMSGATE_URL = '<a href="https://api.sms-gate.app/3rdparty/v1/messages">https://api.sms-gate.app/3rdparty/v1/messages</a>';<br>const MONGODB_URI = <a href="http://process.env">process.env</a>.MONGODB_URI;<br><br>let db, contacts, schedules, logs;<br><br>// --- DATABASE CONNECTION ---<br>async function connectDB() {<br>&nbsp;&nbsp;&nbsp; if (!MONGODB_URI) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.error">console.error</a>("❌ MONGODB_URI is missing from Environment Variables");<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return;<br>&nbsp;&nbsp;&nbsp; }<br>&nbsp;&nbsp;&nbsp; try {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const client = new MongoClient(MONGODB_URI);<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://client.connect">client.connect</a>();<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; db = <a href="http://client.db">client.db</a>('sms-app'); <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; contacts = <a href="http://db.collection">db.collection</a>('contacts');<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; schedules = <a href="http://db.collection">db.collection</a>('schedules');<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; logs = <a href="http://db.collection">db.collection</a>('logs');<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.log">console.log</a>('✅ MongoDB Connected');<br>&nbsp;&nbsp;&nbsp; } catch (err) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.error">console.error</a>('❌ MongoDB Connection Failed:', <a href="http://err.message">err.message</a>);<br>&nbsp;&nbsp;&nbsp; }<br>}<br>connectDB();<br><br>// --- SERVE FRONTEND ---<br><a href="http://app.get">app.get</a>('/', (req, res) =&gt; {<br>&nbsp;&nbsp;&nbsp; <a href="http://res.sendFile">res.sendFile</a>(<a href="http://path.join">path.join</a>(__dirname, '<a href="http://index.html">index.html</a>'));<br>});<br><br>// ==========================================<br>// API ROUTES<br>// ==========================================<br><br>// 1. Get all contacts<br><a href="http://app.get">app.get</a>('/api/contacts', async (req, res) =&gt; {<br>&nbsp;&nbsp;&nbsp; try {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const list = await <a href="http://contacts.find">contacts.find</a>({}).toArray();<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.json">res.json</a>({ contacts: list });<br>&nbsp;&nbsp;&nbsp; } catch (e) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.status">res.status</a>(<a href="tel:500">500</a>).json({ error: 'Failed to fetch contacts' });<br>&nbsp;&nbsp;&nbsp; }<br>});<br><br>// 2. Add bulk contacts<br><a href="http://app.post">app.post</a>('/api/contacts', async (req, res) =&gt; {<br>&nbsp;&nbsp;&nbsp; const { numbers } = <a href="http://req.body">req.body</a>;<br>&nbsp;&nbsp;&nbsp; if (!numbers || <a href="http://numbers.length">numbers.length</a> === 0) return <a href="http://res.status">res.status</a>(<a href="tel:400">400</a>).json({ error: 'No numbers provided' });<br><br>&nbsp;&nbsp;&nbsp; try {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const docs = <a href="http://numbers.map">numbers.map</a>(n =&gt; ({ phone: n, created_at: new Date() }));<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://contacts.insertMany">contacts.insertMany</a>(docs);<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.json">res.json</a>({ success: true, message: `${<a href="http://numbers.length">numbers.length</a>} numbers saved!` });<br>&nbsp;&nbsp;&nbsp; } catch (e) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.status">res.status</a>(<a href="tel:500">500</a>).json({ error: 'Failed to save contacts' });<br>&nbsp;&nbsp;&nbsp; }<br>});<br><br>// 3. Delete ALL contacts<br><a href="http://app.delete">app.delete</a>('/api/contacts/all', async (req, res) =&gt; {<br>&nbsp;&nbsp;&nbsp; try {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://contacts.deleteMany">contacts.deleteMany</a>({}); <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.json">res.json</a>({ success: true, message: 'All contacts deleted successfully!' });<br>&nbsp;&nbsp;&nbsp; } catch (e) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.status">res.status</a>(<a href="tel:500">500</a>).json({ error: 'Failed to delete contacts' });<br>&nbsp;&nbsp;&nbsp; }<br>});<br><br>// 4. Send SMS Now (Manual)<br><a href="http://app.post">app.post</a>('/api/send-now', async (req, res) =&gt; {<br>&nbsp;&nbsp;&nbsp; const { message, numbers } = <a href="http://req.body">req.body</a>;<br>&nbsp;&nbsp;&nbsp; if (!message || !numbers) return <a href="http://res.status">res.status</a>(<a href="tel:400">400</a>).json({ error: 'Missing data' });<br>&nbsp;&nbsp;&nbsp; <br>&nbsp;&nbsp;&nbsp; <a href="http://res.json">res.json</a>({ success: true, message: 'Sending started in background' });<br>&nbsp;&nbsp;&nbsp; <br>&nbsp;&nbsp;&nbsp; processSMS(numbers, message, 'Manual');<br>});<br><br>// 5. Schedule SMS for Later<br><a href="http://app.post">app.post</a>('/api/schedule', async (req, res) =&gt; {<br>&nbsp;&nbsp;&nbsp; const { message, numbers, scheduleTime } = <a href="http://req.body">req.body</a>;<br>&nbsp;&nbsp;&nbsp; if (!message || !numbers || !scheduleTime) return <a href="http://res.status">res.status</a>(<a href="tel:400">400</a>).json({ error: 'Missing data' });<br><br>&nbsp;&nbsp;&nbsp; try {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://schedules.insertOne">schedules.insertOne</a>({<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; message,<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; numbers,<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; scheduleTime: new Date(scheduleTime),<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; status: 'pending',<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; created_at: new Date()<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; });<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.json">res.json</a>({ success: true, message: 'SMS Scheduled successfully!' });<br>&nbsp;&nbsp;&nbsp; } catch (e) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.status">res.status</a>(<a href="tel:500">500</a>).json({ error: 'Failed to schedule SMS' });<br>&nbsp;&nbsp;&nbsp; }<br>});<br><br>// 6. Get Logs<br><a href="http://app.get">app.get</a>('/api/logs', async (req, res) =&gt; {<br>&nbsp;&nbsp;&nbsp; try {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const list = await <a href="http://logs.find">logs.find</a>({}).sort({ created_at: -1 }).limit(<a href="tel:100">100</a>).toArray();<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.json">res.json</a>({ logs: list });<br>&nbsp;&nbsp;&nbsp; } catch (e) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.status">res.status</a>(<a href="tel:500">500</a>).json({ error: 'Failed to fetch logs' });<br>&nbsp;&nbsp;&nbsp; }<br>});<br><br>// 7. Delete ALL Logs<br><a href="http://app.delete">app.delete</a>('/api/logs/all', async (req, res) =&gt; {<br>&nbsp;&nbsp;&nbsp; try {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://logs.deleteMany">logs.deleteMany</a>({}); <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.json">res.json</a>({ success: true, message: 'All logs deleted successfully!' });<br>&nbsp;&nbsp;&nbsp; } catch (e) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://res.status">res.status</a>(<a href="tel:500">500</a>).json({ error: 'Failed to delete logs' });<br>&nbsp;&nbsp;&nbsp; }<br>});<br><br><br>// ==========================================<br>// CORE SMS LOGIC (SMSGATE)<br>// ==========================================<br>async function processSMS(numbers, message, type) {<br>&nbsp;&nbsp;&nbsp; if (!SMSGATE_USER || !SMSGATE_PASS) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.error">console.error</a>('❌ SMSGate credentials missing in Render!');<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return;<br>&nbsp;&nbsp;&nbsp; }<br><br>&nbsp;&nbsp;&nbsp; for (const number of numbers) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // 🛑 1. FREE FORMAT CHECKER 🛑<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // This stops fake numbers (e.g. <a href="tel:12345">12345</a>) or wrong formats instantly<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if (!isValidKePhone(number)) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.log">console.log</a>(`⏭️ Skipping invalid format: ${number}`);<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://logs.insertOne">logs.insertOne</a>({ <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; phone: number, <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; message: message,<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; status: 'skipped_invalid', // This will show up in your Logs tab<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; type, <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; created_at: new Date(), <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; error: 'Invalid Kenyan mobile number format' <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; });<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; continue; // Skip to the next number immediately<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }<br><br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // 2. SEND THE SMS (If valid format)<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; try {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const auth = <a href="http://Buffer.from">Buffer.from</a>(`${SMSGATE_USER}:${SMSGATE_PASS}`).toString('base64');<br><br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const response = await fetch(SMSGATE_URL, {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; method: 'POST',<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; headers: {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 'Authorization': `Basic ${auth}`,<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 'Content-Type': 'application/json'<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; },<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; body: <a href="http://JSON.stringify">JSON.stringify</a>({<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; phoneNumbers: [number],<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; textMessage: { text: message }<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; })<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; });<br><br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const isSuccess = <a href="http://response.status">response.status</a> === <a href="tel:202">202</a> || <a href="http://response.ok">response.ok</a>;<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; let errorMsg = null;<br><br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if (!isSuccess) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const data = await <a href="http://response.json">response.json</a>().catch(() =&gt; ({}));<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; errorMsg = <a href="http://JSON.stringify">JSON.stringify</a>(data) || `HTTP ${<a href="http://response.status">response.status</a>}`;<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.error">console.error</a>(`Failed to send to ${number}:`, errorMsg);<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }<br><br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://logs.insertOne">logs.insertOne</a>({ <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; phone: number, <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; message, <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; status: isSuccess ? 'success' : 'failed', <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; type, <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; created_at: new Date(), <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; error: errorMsg<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; });<br><br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } catch (error) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.error">console.error</a>(`Network error sending to ${number}:`, <a href="http://error.message">error.message</a>);<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://logs.insertOne">logs.insertOne</a>({ <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; phone: number, <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; message, <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; status: 'failed', <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; type, <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; created_at: new Date(), <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; error: 'Network error: ' + <a href="http://error.message">error.message</a> <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; });<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // Wait 3 seconds before sending the next message<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await new Promise(r =&gt; setTimeout(r, <a href="tel:3000">3000</a>));<br>&nbsp;&nbsp;&nbsp; }<br>}<br><br>// ==========================================<br>// CRON JOB: Check for Scheduled Messages<br>// ==========================================<br><a href="http://cron.schedule">cron.schedule</a>('* * * * *', async () =&gt; {<br>&nbsp;&nbsp;&nbsp; try {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const now = new Date();<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; const pendingSchedules = await <a href="http://schedules.find">schedules.find</a>({ status: 'pending', scheduleTime: { $lte: now } }).toArray();<br><br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for (const schedule of pendingSchedules) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://schedules.updateOne">schedules.updateOne</a>({ _id: schedule._id }, { $set: { status: 'processing' } });<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.log">console.log</a>(`⏰ Running scheduled SMS to ${<a href="http://schedule.numbers.length">schedule.numbers.length</a>} people...`);<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await processSMS(<a href="http://schedule.numbers">schedule.numbers</a>, <a href="http://schedule.message">schedule.message</a>, 'Scheduled');<br><br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; await <a href="http://schedules.updateOne">schedules.updateOne</a>({ _id: schedule._id }, { $set: { status: 'completed' } });<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.log">console.log</a>(`✅ Finished scheduled batch.`);<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }<br>&nbsp;&nbsp;&nbsp; } catch (e) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <a href="http://console.error">console.error</a>('Cron job error:', <a href="http://e.message">e.message</a>);<br>&nbsp;&nbsp;&nbsp; }<br>});<br><br>// --- START SERVER ---<br>const PORT = <a href="http://process.env.PORT">process.env.PORT</a> || <a href="tel:4000">4000</a>;<br><a href="http://app.listen">app.listen</a>(PORT, () =&gt; <a href="http://console.log">console.log</a>(`🚀 SMS Server running on port ${PORT}`));</body></html>
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const { MongoClient } = require('mongodb');
+const cron = require('node-cron');
+require('dotenv').config();
+
+// ✅ IMPORT THE FREE NUMBER CHECKER
+const { isValidKePhone } = require('kenya-utils');
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+// --- CONFIGURATION ---
+const SMSGATE_USER = process.env.SMSGATE_USER;
+const SMSGATE_PASS = process.env.SMSGATE_PASS;
+const SMSGATE_URL = 'https://api.sms-gate.app/3rdparty/v1/messages';
+const MONGODB_URI = process.env.MONGODB_URI;
+
+let db, contacts, schedules, logs;
+
+// --- DATABASE CONNECTION ---
+async function connectDB() {
+    if (!MONGODB_URI) {
+        console.error("❌ MONGODB_URI is missing from Environment Variables");
+        return;
+    }
+    try {
+        const client = new MongoClient(MONGODB_URI);
+        await client.connect();
+        db = client.db('sms-app'); 
+        contacts = db.collection('contacts');
+        schedules = db.collection('schedules');
+        logs = db.collection('logs');
+        console.log('✅ MongoDB Connected');
+    } catch (err) {
+        console.error('❌ MongoDB Connection Failed:', err.message);
+    }
+}
+connectDB();
+
+// --- SERVE FRONTEND ---
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+// ==========================================
+// API ROUTES
+// ==========================================
+
+// 1. Get all contacts
+app.get('/api/contacts', async (req, res) => {
+    try {
+        const list = await contacts.find({}).toArray();
+        res.json({ contacts: list });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to fetch contacts' });
+    }
+});
+
+// 2. Add bulk contacts
+app.post('/api/contacts', async (req, res) => {
+    const { numbers } = req.body;
+    if (!numbers || numbers.length === 0) return res.status(400).json({ error: 'No numbers provided' });
+
+    try {
+        const docs = numbers.map(n => ({ phone: n, created_at: new Date() }));
+        await contacts.insertMany(docs);
+        res.json({ success: true, message: `${numbers.length} numbers saved!` });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to save contacts' });
+    }
+});
+
+// 3. Delete ALL contacts
+app.delete('/api/contacts/all', async (req, res) => {
+    try {
+        await contacts.deleteMany({}); 
+        res.json({ success: true, message: 'All contacts deleted successfully!' });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to delete contacts' });
+    }
+});
+
+// 4. Send SMS Now (Manual)
+app.post('/api/send-now', async (req, res) => {
+    const { message, numbers } = req.body;
+    if (!message || !numbers) return res.status(400).json({ error: 'Missing data' });
+    
+    res.json({ success: true, message: 'Sending started in background' });
+    
+    processSMS(numbers, message, 'Manual');
+});
+
+// 5. Schedule SMS for Later
+app.post('/api/schedule', async (req, res) => {
+    const { message, numbers, scheduleTime } = req.body;
+    if (!message || !numbers || !scheduleTime) return res.status(400).json({ error: 'Missing data' });
+
+    try {
+        await schedules.insertOne({
+            message,
+            numbers,
+            scheduleTime: new Date(scheduleTime),
+            status: 'pending',
+            created_at: new Date()
+        });
+        res.json({ success: true, message: 'SMS Scheduled successfully!' });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to schedule SMS' });
+    }
+});
+
+// 6. Get Logs
+app.get('/api/logs', async (req, res) => {
+    try {
+        const list = await logs.find({}).sort({ created_at: -1 }).limit(100).toArray();
+        res.json({ logs: list });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to fetch logs' });
+    }
+});
+
+// 7. Delete ALL Logs
+app.delete('/api/logs/all', async (req, res) => {
+    try {
+        await logs.deleteMany({}); 
+        res.json({ success: true, message: 'All logs deleted successfully!' });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to delete logs' });
+    }
+});
+
+
+// ==========================================
+// CORE SMS LOGIC (SMSGATE)
+// ==========================================
+async function processSMS(numbers, message, type) {
+    if (!SMSGATE_USER || !SMSGATE_PASS) {
+        console.error('❌ SMSGate credentials missing in Render!');
+        return;
+    }
+
+    for (const number of numbers) {
+        
+        // 🛑 1. FREE FORMAT CHECKER 🛑
+        // This stops fake numbers (e.g. 12345) or wrong formats instantly
+        if (!isValidKePhone(number)) {
+            console.log(`⏭️ Skipping invalid format: ${number}`);
+            
+            await logs.insertOne({ 
+                phone: number, 
+                message: message,
+                status: 'skipped_invalid', // This will show up in your Logs tab
+                type, 
+                created_at: new Date(), 
+                error: 'Invalid Kenyan mobile number format' 
+            });
+            
+            continue; // Skip to the next number immediately
+        }
+
+        // 2. SEND THE SMS (If valid format)
+        try {
+            const auth = Buffer.from(`${SMSGATE_USER}:${SMSGATE_PASS}`).toString('base64');
+
+            const response = await fetch(SMSGATE_URL, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Basic ${auth}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    phoneNumbers: [number],
+                    textMessage: { text: message }
+                })
+            });
+
+            const isSuccess = response.status === 202 || response.ok;
+            let errorMsg = null;
+
+            if (!isSuccess) {
+                const data = await response.json().catch(() => ({}));
+                errorMsg = JSON.stringify(data) || `HTTP ${response.status}`;
+                console.error(`Failed to send to ${number}:`, errorMsg);
+            }
+
+            await logs.insertOne({ 
+                phone: number, 
+                message, 
+                status: isSuccess ? 'success' : 'failed', 
+                type, 
+                created_at: new Date(), 
+                error: errorMsg
+            });
+
+        } catch (error) {
+            console.error(`Network error sending to ${number}:`, error.message);
+            await logs.insertOne({ 
+                phone: number, 
+                message, 
+                status: 'failed', 
+                type, 
+                created_at: new Date(), 
+                error: 'Network error: ' + error.message 
+            });
+        }
+        
+        // Wait 3 seconds before sending the next message
+        await new Promise(r => setTimeout(r, 3000));
+    }
+}
+
+// ==========================================
+// CRON JOB: Check for Scheduled Messages
+// ==========================================
+cron.schedule('* * * * *', async () => {
+    try {
+        const now = new Date();
+        const pendingSchedules = await schedules.find({ status: 'pending', scheduleTime: { $lte: now } }).toArray();
+
+        for (const schedule of pendingSchedules) {
+            await schedules.updateOne({ _id: schedule._id }, { $set: { status: 'processing' } });
+            
+            console.log(`⏰ Running scheduled SMS to ${schedule.numbers.length} people...`);
+            await processSMS(schedule.numbers, schedule.message, 'Scheduled');
+
+            await schedules.updateOne({ _id: schedule._id }, { $set: { status: 'completed' } });
+            console.log(`✅ Finished scheduled batch.`);
+        }
+    } catch (e) {
+        console.error('Cron job error:', e.message);
+    }
+});
+
+// --- START SERVER ---
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => console.log(`🚀 SMS Server running on port ${PORT}`));
