@@ -1,11 +1,6 @@
 {
   "name": "smspro",
   "version": "1.0.0",
-  "description": "SMS Pro Application",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
