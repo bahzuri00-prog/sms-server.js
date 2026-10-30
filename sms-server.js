@@ -29,7 +29,7 @@ async function connectDB() {
     try {
         const client = new MongoClient(MONGODB_URI);
         await client.connect();
-        db = client.db('sms-app'); 
+        db = client.db('smspro_2');
         contacts = db.collection('contacts');
         schedules = db.collection('schedules');
         logs = db.collection('logs');
