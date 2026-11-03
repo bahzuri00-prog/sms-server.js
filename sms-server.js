@@ -5,8 +5,15 @@ const { MongoClient } = require('mongodb');
 const cron = require('node-cron');
 require('dotenv').config();
 
-// ✅ IMPORT THE FREE NUMBER CHECKER
-const { isValidKePhone } = require('kenya-utils');
+// 🛡️ SAFE REQUIRE FOR KENYA-UTILS (Prevents MODULE_NOT_FOUND crash)
+let isValidKePhone;
+try {
+    const kenyaUtils = require('kenya-utils');
+    isValidKePhone = kenyaUtils.isValidKePhone;
+} catch (error) {
+    console.log('⚠️ kenya-utils package not found. Using built-in fallback checker.');
+    isValidKePhone = (phone) => /^(?:\+254|0)(?:7|1)\d{8}$/.test(phone);
+}
 
 const app = express();
 app.use(cors());
@@ -29,16 +36,45 @@ async function connectDB() {
     try {
         const client = new MongoClient(MONGODB_URI);
         await client.connect();
-        db = client.db('smspro_2');
+        db = client.db('smspro_2'); // Kept your specific database name
         contacts = db.collection('contacts');
         schedules = db.collection('schedules');
         logs = db.collection('logs');
-        console.log('✅ MongoDB Connected');
+        console.log('✅ MongoDB Connected (smspro_2)');
     } catch (err) {
         console.error('❌ MongoDB Connection Failed:', err.message);
     }
 }
 connectDB();
+
+// ==========================================
+// RANDOM NUMBER GENERATOR (Safaricom + Airtel, 07 + 01)
+// ==========================================
+const SAFARICOM_PREFIXES = [
+    '070','071','072','074','0757','0758','0759','0768','0769','079',
+    '0110','0111','0112','0113','0114','0115','0116','0117','0118','0119'
+];
+
+const AIRTEL_PREFIXES = [
+    '073','0750','0751','0752','0753','0754','0755','0756','078',
+    '0100','0101','0102','0103','0104','0105','0106','0107','0108','0109'
+];
+
+function randomKenyanNumber(network = 'both') {
+    let pool;
+    if (network === 'safaricom')   pool = SAFARICOM_PREFIXES;
+    else if (network === 'airtel') pool = AIRTEL_PREFIXES;
+    else                           pool = [...SAFARICOM_PREFIXES, ...AIRTEL_PREFIXES];
+
+    const prefix = pool[Math.floor(Math.random() * pool.length)];
+    const digitsLeft = 10 - prefix.length;
+
+    let suffix = '';
+    for (let i = 0; i < digitsLeft; i++) {
+        suffix += Math.floor(Math.random() * 10);
+    }
+    return prefix + suffix;
+}
 
 // --- SERVE FRONTEND ---
 app.get('/', (req, res) => {
@@ -59,16 +95,36 @@ app.get('/api/contacts', async (req, res) => {
     }
 });
 
-// 2. Add bulk contacts
+// 2. Add bulk contacts (✅ FAST & DUPLICATE PROTECTED)
 app.post('/api/contacts', async (req, res) => {
     const { numbers } = req.body;
     if (!numbers || numbers.length === 0) return res.status(400).json({ error: 'No numbers provided' });
 
     try {
-        const docs = numbers.map(n => ({ phone: n, created_at: new Date() }));
+        // 1. Remove duplicates from the incoming list
+        const uniqueNumbers = [...new Set(numbers)];
+        
+        // 2. Find which of these numbers ALREADY exist in the database
+        const existingDocs = await contacts.find({ phone: { $in: uniqueNumbers } }).toArray();
+        const existingSet = new Set(existingDocs.map(d => d.phone));
+        
+        // 3. Keep ONLY the numbers that are NOT in the database
+        const newNumbers = uniqueNumbers.filter(n => !existingSet.has(n));
+        
+        if (newNumbers.length === 0) {
+             return res.json({ success: true, message: `Saved 0 new numbers. (All ${numbers.length} were already in the database).` });
+        }
+        
+        // 4. Save the new numbers all at once
+        const docs = newNumbers.map(n => ({ phone: n, created_at: new Date() }));
         await contacts.insertMany(docs);
-        res.json({ success: true, message: `${numbers.length} numbers saved!` });
+        
+        res.json({ 
+            success: true, 
+            message: `Successfully saved ${newNumbers.length} numbers! (Skipped ${numbers.length - newNumbers.length} duplicates).` 
+        });
     } catch (e) {
+        console.error(e);
         res.status(500).json({ error: 'Failed to save contacts' });
     }
 });
@@ -132,6 +188,26 @@ app.delete('/api/logs/all', async (req, res) => {
     }
 });
 
+// 8. Generate random Kenyan numbers (✅ INCREASED LIMIT TO 5000)
+app.post('/api/generate-numbers', (req, res) => {
+    const { count = 10, network = 'both', exclude = [] } = req.body;
+    const amount = Math.min(Math.max(parseInt(count) || 10, 1), 5000);
+
+    const excludeSet = new Set(exclude.map(n => String(n).trim()).filter(Boolean));
+    const result = new Set();
+    let safety = 0;
+    const maxAttempts = Math.max(amount * 100, 5000);
+    
+    while (result.size < amount && safety < maxAttempts) {
+        const num = randomKenyanNumber(network);
+        if (!excludeSet.has(num) && !result.has(num)) {
+            result.add(num);
+        }
+        safety++;
+    }
+
+    res.json({ numbers: [...result], count: result.size });
+});
 
 // ==========================================
 // CORE SMS LOGIC (SMSGATE)
@@ -145,23 +221,22 @@ async function processSMS(numbers, message, type) {
     for (const number of numbers) {
         
         // 🛑 1. FREE FORMAT CHECKER 🛑
-        // This stops fake numbers (e.g. 12345) or wrong formats instantly
-        if (!isValidKePhone(number)) {
+        if (typeof isValidKePhone === 'function' && !isValidKePhone(number)) {
             console.log(`⏭️ Skipping invalid format: ${number}`);
             
             await logs.insertOne({ 
                 phone: number, 
                 message: message,
-                status: 'skipped_invalid', // This will show up in your Logs tab
+                status: 'skipped_invalid', 
                 type, 
                 created_at: new Date(), 
                 error: 'Invalid Kenyan mobile number format' 
             });
             
-            continue; // Skip to the next number immediately
+            continue; 
         }
 
-        // 2. SEND THE SMS (If valid format)
+        // 2. SEND THE SMS
         try {
             const auth = Buffer.from(`${SMSGATE_USER}:${SMSGATE_PASS}`).toString('base64');
 
@@ -173,7 +248,7 @@ async function processSMS(numbers, message, type) {
                 },
                 body: JSON.stringify({
                     phoneNumbers: [number],
-                    textMessage: { text: message },withDeliveryReport: false
+                    textMessage: { text: message }, withDeliveryReport: false
                 })
             });
 
@@ -207,7 +282,6 @@ async function processSMS(numbers, message, type) {
             });
         }
         
-        // Wait 3 seconds before sending the next message
         await new Promise(r => setTimeout(r, 3000));
     }
 }
