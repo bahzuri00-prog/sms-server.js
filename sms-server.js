@@ -1,17 +1,17 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { MongoClient } = require('mongodb');
+const { createClient } = require('@libsql/client');
 const cron = require('node-cron');
 require('dotenv').config();
 
-// 🛡️ SAFE REQUIRE FOR KENYA-UTILS (Prevents MODULE_NOT_FOUND crash)
+// 🛡️ SAFE REQUIRE FOR KENYA-UTILS
 let isValidKePhone;
 try {
     const kenyaUtils = require('kenya-utils');
     isValidKePhone = kenyaUtils.isValidKePhone;
 } catch (error) {
-    console.log('⚠️ kenya-utils package not found. Using built-in fallback checker.');
+    console.log('⚠️ kenya-utils not found. Using fallback.');
     isValidKePhone = (phone) => /^(?:\+254|0)(?:7|1)\d{8}$/.test(phone);
 }
 
@@ -23,233 +23,160 @@ app.use(express.json({ limit: '10mb' }));
 const SMSGATE_USER = process.env.SMSGATE_USER;
 const SMSGATE_PASS = process.env.SMSGATE_PASS;
 const SMSGATE_URL = 'https://api.sms-gate.app/3rdparty/v1/messages';
-const MONGODB_URI = process.env.MONGODB_URI;
 
-let db, contacts, schedules, logs;
+// --- TURSO DATABASE CONNECTION ---
+const db = createClient({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+});
 
-// --- DATABASE CONNECTION ---
-async function connectDB() {
-    if (!MONGODB_URI) {
-        console.error("❌ MONGODB_URI is missing from Environment Variables");
-        return;
-    }
+// --- CREATE TABLES ON STARTUP ---
+async function initDB() {
     try {
-        const client = new MongoClient(MONGODB_URI);
-        await client.connect();
-        db = client.db('smspro_2'); // Kept your specific database name
-        contacts = db.collection('contacts');
-        schedules = db.collection('schedules');
-        logs = db.collection('logs');
-        console.log('✅ MongoDB Connected (smspro_2)');
+        // Run sequentially to prevent the Turso 400 Migration Error
+        await db.execute("CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT UNIQUE, created_at TEXT)");
+        await db.execute("CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT, numbers TEXT, schedule_time TEXT, status TEXT, created_at TEXT)");
+        await db.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT, message TEXT, status TEXT, type TEXT, created_at TEXT, error TEXT)");
+        
+        console.log('✅ Turso Database Connected & Tables Ready (Website #2)');
     } catch (err) {
-        console.error('❌ MongoDB Connection Failed:', err.message);
+        console.error('❌ Turso Connection Failed:', err.message);
     }
 }
-connectDB();
+initDB();
 
 // ==========================================
 // RANDOM NUMBER GENERATOR (Safaricom + Airtel, 07 + 01)
 // ==========================================
-const SAFARICOM_PREFIXES = [
-    '070','071','072','074','0757','0758','0759','0768','0769','079',
-    '0110','0111','0112','0113','0114','0115','0116','0117','0118','0119'
-];
-
-const AIRTEL_PREFIXES = [
-    '073','0750','0751','0752','0753','0754','0755','0756','078',
-    '0100','0101','0102','0103','0104','0105','0106','0107','0108','0109'
-];
+const SAFARICOM_PREFIXES = ['070','071','072','074','0757','0758','0759','0768','0769','079','0110','0111','0112','0113','0114','0115','0116','0117','0118','0119'];
+const AIRTEL_PREFIXES = ['073','0750','0751','0752','0753','0754','0755','0756','078','0100','0101','0102','0103','0104','0105','0106','0107','0108','0109'];
 
 function randomKenyanNumber(network = 'both') {
-    let pool;
-    if (network === 'safaricom')   pool = SAFARICOM_PREFIXES;
-    else if (network === 'airtel') pool = AIRTEL_PREFIXES;
-    else                           pool = [...SAFARICOM_PREFIXES, ...AIRTEL_PREFIXES];
-
+    let pool = network === 'safaricom' ? SAFARICOM_PREFIXES : network === 'airtel' ? AIRTEL_PREFIXES : [...SAFARICOM_PREFIXES, ...AIRTEL_PREFIXES];
     const prefix = pool[Math.floor(Math.random() * pool.length)];
-    const digitsLeft = 10 - prefix.length;
-
     let suffix = '';
-    for (let i = 0; i < digitsLeft; i++) {
-        suffix += Math.floor(Math.random() * 10);
-    }
+    for (let i = 0; i < (10 - prefix.length); i++) suffix += Math.floor(Math.random() * 10);
     return prefix + suffix;
 }
 
 // --- SERVE FRONTEND ---
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
-});
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
 // ==========================================
 // API ROUTES
 // ==========================================
 
-// 1. Get all contacts
 app.get('/api/contacts', async (req, res) => {
     try {
-        const list = await contacts.find({}).toArray();
-        res.json({ contacts: list });
-    } catch (e) {
-        res.status(500).json({ error: 'Failed to fetch contacts' });
-    }
+        const result = await db.execute("SELECT * FROM contacts");
+        res.json({ contacts: result.rows });
+    } catch (e) { res.status(500).json({ error: 'Failed to fetch contacts' }); }
 });
 
-// 2. Add bulk contacts (✅ FAST & DUPLICATE PROTECTED)
 app.post('/api/contacts', async (req, res) => {
     const { numbers } = req.body;
     if (!numbers || numbers.length === 0) return res.status(400).json({ error: 'No numbers provided' });
 
     try {
-        // 1. Remove duplicates from the incoming list
-        const uniqueNumbers = [...new Set(numbers)];
+        const now = new Date().toISOString();
         
-        // 2. Find which of these numbers ALREADY exist in the database
-        const existingDocs = await contacts.find({ phone: { $in: uniqueNumbers } }).toArray();
-        const existingSet = new Set(existingDocs.map(d => d.phone));
+        // INSERT OR IGNORE handles duplicate protection instantly in SQLite
+        const statements = numbers.map(num => ({
+            sql: 'INSERT OR IGNORE INTO contacts (phone, created_at) VALUES (?, ?)',
+            args: [num, now]
+        }));
         
-        // 3. Keep ONLY the numbers that are NOT in the database
-        const newNumbers = uniqueNumbers.filter(n => !existingSet.has(n));
+        const result = await db.batch(statements, "write");
         
-        if (newNumbers.length === 0) {
-             return res.json({ success: true, message: `Saved 0 new numbers. (All ${numbers.length} were already in the database).` });
-        }
-        
-        // 4. Save the new numbers all at once
-        const docs = newNumbers.map(n => ({ phone: n, created_at: new Date() }));
-        await contacts.insertMany(docs);
-        
-        res.json({ 
-            success: true, 
-            message: `Successfully saved ${newNumbers.length} numbers! (Skipped ${numbers.length - newNumbers.length} duplicates).` 
-        });
+        const savedCount = result.reduce((acc, curr) => acc + curr.rowsAffected, 0);
+        const skippedCount = numbers.length - savedCount;
+
+        res.json({ success: true, message: `Saved ${savedCount} new numbers. (Skipped ${skippedCount} duplicates).` });
     } catch (e) {
         console.error(e);
         res.status(500).json({ error: 'Failed to save contacts' });
     }
 });
 
-// 3. Delete ALL contacts
 app.delete('/api/contacts/all', async (req, res) => {
     try {
-        await contacts.deleteMany({}); 
+        await db.execute("DELETE FROM contacts");
         res.json({ success: true, message: 'All contacts deleted successfully!' });
-    } catch (e) {
-        res.status(500).json({ error: 'Failed to delete contacts' });
-    }
+    } catch (e) { res.status(500).json({ error: 'Failed to delete contacts' }); }
 });
 
-// 4. Send SMS Now (Manual)
 app.post('/api/send-now', async (req, res) => {
     const { message, numbers } = req.body;
     if (!message || !numbers) return res.status(400).json({ error: 'Missing data' });
-    
     res.json({ success: true, message: 'Sending started in background' });
-    
     processSMS(numbers, message, 'Manual');
 });
 
-// 5. Schedule SMS for Later
 app.post('/api/schedule', async (req, res) => {
     const { message, numbers, scheduleTime } = req.body;
     if (!message || !numbers || !scheduleTime) return res.status(400).json({ error: 'Missing data' });
 
     try {
-        await schedules.insertOne({
-            message,
-            numbers,
-            scheduleTime: new Date(scheduleTime),
-            status: 'pending',
-            created_at: new Date()
+        await db.execute({
+            sql: 'INSERT INTO schedules (message, numbers, schedule_time, status, created_at) VALUES (?, ?, ?, ?, ?)',
+            args: [message, JSON.stringify(numbers), new Date(scheduleTime).toISOString(), 'pending', new Date().toISOString()]
         });
         res.json({ success: true, message: 'SMS Scheduled successfully!' });
-    } catch (e) {
-        res.status(500).json({ error: 'Failed to schedule SMS' });
-    }
+    } catch (e) { res.status(500).json({ error: 'Failed to schedule SMS' }); }
 });
 
-// 6. Get Logs
 app.get('/api/logs', async (req, res) => {
     try {
-        const list = await logs.find({}).sort({ created_at: -1 }).limit(100).toArray();
-        res.json({ logs: list });
-    } catch (e) {
-        res.status(500).json({ error: 'Failed to fetch logs' });
-    }
+        const result = await db.execute("SELECT * FROM logs ORDER BY id DESC LIMIT 100");
+        res.json({ logs: result.rows });
+    } catch (e) { res.status(500).json({ error: 'Failed to fetch logs' }); }
 });
 
-// 7. Delete ALL Logs
 app.delete('/api/logs/all', async (req, res) => {
     try {
-        await logs.deleteMany({}); 
+        await db.execute("DELETE FROM logs");
         res.json({ success: true, message: 'All logs deleted successfully!' });
-    } catch (e) {
-        res.status(500).json({ error: 'Failed to delete logs' });
-    }
+    } catch (e) { res.status(500).json({ error: 'Failed to delete logs' }); }
 });
 
-// 8. Generate random Kenyan numbers (✅ INCREASED LIMIT TO 5000)
 app.post('/api/generate-numbers', (req, res) => {
     const { count = 10, network = 'both', exclude = [] } = req.body;
     const amount = Math.min(Math.max(parseInt(count) || 10, 1), 5000);
-
     const excludeSet = new Set(exclude.map(n => String(n).trim()).filter(Boolean));
     const result = new Set();
     let safety = 0;
-    const maxAttempts = Math.max(amount * 100, 5000);
     
-    while (result.size < amount && safety < maxAttempts) {
+    while (result.size < amount && safety < Math.max(amount * 100, 5000)) {
         const num = randomKenyanNumber(network);
-        if (!excludeSet.has(num) && !result.has(num)) {
-            result.add(num);
-        }
+        if (!excludeSet.has(num) && !result.has(num)) result.add(num);
         safety++;
     }
-
     res.json({ numbers: [...result], count: result.size });
 });
 
 // ==========================================
-// CORE SMS LOGIC (SMSGATE)
+// CORE SMS LOGIC
 // ==========================================
 async function processSMS(numbers, message, type) {
-    if (!SMSGATE_USER || !SMSGATE_PASS) {
-        console.error('❌ SMSGate credentials missing in Render!');
-        return;
-    }
+    if (!SMSGATE_USER || !SMSGATE_PASS) return console.error('❌ SMSGate credentials missing!');
 
     for (const number of numbers) {
+        const now = new Date().toISOString();
         
-        // 🛑 1. FREE FORMAT CHECKER 🛑
         if (typeof isValidKePhone === 'function' && !isValidKePhone(number)) {
-            console.log(`⏭️ Skipping invalid format: ${number}`);
-            
-            await logs.insertOne({ 
-                phone: number, 
-                message: message,
-                status: 'skipped_invalid', 
-                type, 
-                created_at: new Date(), 
-                error: 'Invalid Kenyan mobile number format' 
+            await db.execute({
+                sql: 'INSERT INTO logs (phone, message, status, type, created_at, error) VALUES (?, ?, ?, ?, ?, ?)',
+                args: [number, message, 'skipped_invalid', type, now, 'Invalid Kenyan mobile number format']
             });
-            
-            continue; 
+            continue;
         }
 
-        // 2. SEND THE SMS
         try {
             const auth = Buffer.from(`${SMSGATE_USER}:${SMSGATE_PASS}`).toString('base64');
-
             const response = await fetch(SMSGATE_URL, {
                 method: 'POST',
-                headers: {
-                    'Authorization': `Basic ${auth}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    phoneNumbers: [number],
-                    textMessage: { text: message }, withDeliveryReport: false
-                })
+                headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phoneNumbers: [number], textMessage: { text: message }, withDeliveryReport: false })
             });
 
             const isSuccess = response.status === 202 || response.ok;
@@ -258,56 +185,45 @@ async function processSMS(numbers, message, type) {
             if (!isSuccess) {
                 const data = await response.json().catch(() => ({}));
                 errorMsg = JSON.stringify(data) || `HTTP ${response.status}`;
-                console.error(`Failed to send to ${number}:`, errorMsg);
             }
 
-            await logs.insertOne({ 
-                phone: number, 
-                message, 
-                status: isSuccess ? 'success' : 'failed', 
-                type, 
-                created_at: new Date(), 
-                error: errorMsg
+            await db.execute({
+                sql: 'INSERT INTO logs (phone, message, status, type, created_at, error) VALUES (?, ?, ?, ?, ?, ?)',
+                args: [number, message, isSuccess ? 'success' : 'failed', type, now, errorMsg]
             });
 
         } catch (error) {
-            console.error(`Network error sending to ${number}:`, error.message);
-            await logs.insertOne({ 
-                phone: number, 
-                message, 
-                status: 'failed', 
-                type, 
-                created_at: new Date(), 
-                error: 'Network error: ' + error.message 
+            await db.execute({
+                sql: 'INSERT INTO logs (phone, message, status, type, created_at, error) VALUES (?, ?, ?, ?, ?, ?)',
+                args: [number, message, 'failed', type, now, 'Network error: ' + error.message]
             });
         }
-        
         await new Promise(r => setTimeout(r, 3000));
     }
 }
 
 // ==========================================
-// CRON JOB: Check for Scheduled Messages
+// CRON JOB
 // ==========================================
 cron.schedule('* * * * *', async () => {
     try {
-        const now = new Date();
-        const pendingSchedules = await schedules.find({ status: 'pending', scheduleTime: { $lte: now } }).toArray();
+        const now = new Date().toISOString();
+        const result = await db.execute({
+            sql: "SELECT * FROM schedules WHERE status = 'pending' AND schedule_time <= ?",
+            args: [now]
+        });
 
-        for (const schedule of pendingSchedules) {
-            await schedules.updateOne({ _id: schedule._id }, { $set: { status: 'processing' } });
+        for (const schedule of result.rows) {
+            await db.execute({ sql: "UPDATE schedules SET status = 'processing' WHERE id = ?", args: [schedule.id] });
             
-            console.log(`⏰ Running scheduled SMS to ${schedule.numbers.length} people...`);
-            await processSMS(schedule.numbers, schedule.message, 'Scheduled');
+            const numbers = JSON.parse(schedule.numbers);
+            await processSMS(numbers, schedule.message, 'Scheduled');
 
-            await schedules.updateOne({ _id: schedule._id }, { $set: { status: 'completed' } });
-            console.log(`✅ Finished scheduled batch.`);
+            await db.execute({ sql: "UPDATE schedules SET status = 'completed' WHERE id = ?", args: [schedule.id] });
         }
-    } catch (e) {
-        console.error('Cron job error:', e.message);
-    }
+    } catch (e) { console.error('Cron job error:', e.message); }
 });
 
 // --- START SERVER ---
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`🚀 SMS Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 SMS Server #2 running on Turso at port ${PORT}`));
